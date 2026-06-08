@@ -1,923 +1,344 @@
-# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
+# KDA算子分析
+以下性能数据来源于FLA仓pytest用例，执行指令为`pytest tests/ops/test_kda_chunk.py::test_megatron_varlen`，用例为`(32, [0, 2048, 4096, 8192], True, -5.0, torch.bfloat16)`。
 
-import torch
-import triton
-import triton.language as tl
+通过msprof工具抓取KDA算子性能，可以发现该算子由十余个triton kernel算子拼接实现，单轮用时260ms，以下两个算子为主要瓶颈：
 
-from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu, chunk_gated_delta_rule_fwd_h
-from fla.ops.cp import FLACPContext
-from fla.ops.cp.chunk_delta_h import (
-    chunk_gated_delta_rule_bwd_dhu_pre_process,
-    expand_h0,
-)
-from fla.ops.kda.chunk_intra import chunk_kda_bwd_intra
-from fla.ops.kda.gate import kda_gate_bwd, kda_gate_chunk_cumsum
-from fla.ops.kda.wy_fast import recompute_w_u_fwd
-from fla.ops.utils import chunk_local_cumsum, prepare_chunk_indices
-from fla.ops.utils.constant import RCP_LN2
-from fla.ops.utils.op import exp2
-from fla.utils import (
-    IS_NVIDIA_HOPPER,
-    autotune_cache_kwargs,
-    check_shared_mem,
-)
++ chunk_kda_bwd_kernel_wy_dqkg_fused_opt_v2（159ms）
++ chunk_kda_bwd_kernel_intra（45ms）
 
-BK_LIST = [64] if check_shared_mem() else [32]
-BV_LIST = [64] if check_shared_mem('ampere') else [32]
-NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2]
+因此下文主要优化这两个瓶颈算子。
 
 
-@triton.heuristics({
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
-})
-# @triton.autotune(
-#     configs=[
-#         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-#         for num_warps in NUM_WARPS
-#         for num_stages in [2, 3, 4]
-#     ],
-#     key=['H', 'K', 'V', 'BT', 'BK', 'BV'],
-#     **autotune_cache_kwargs,
-# )
-@triton.autotune(
-    configs=[triton.Config({}, num_warps=2, num_stages=2)],
-    key=['H', 'K', 'V', 'BT', 'BK', 'BV'],
-    **autotune_cache_kwargs,
-)
-@triton.jit(do_not_specialize=['T'])
-def chunk_kda_bwd_kernel_dAv(
-    q,
-    k,
-    v,
-    A,
-    do,
-    dv,
-    dA,
-    cu_seqlens,
-    chunk_indices,
-    scale,
-    T,
-    H: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BT: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-):
-    i_t, i_bh = tl.program_id(0), tl.program_id(1)
-    i_b, i_h = i_bh // H, i_bh % H
-    if IS_VARLEN:
-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
-        T = eos - bos
-    else:
-        bos, eos = i_b * T, i_b * T + T
 
-    # offset calculation
-    q += (bos * H + i_h) * K
-    k += (bos * H + i_h) * K
-    v += (bos * H + i_h) * V
-    do += (bos * H + i_h) * V
-    dv += (bos * H + i_h) * V
-    dA += (bos * H + i_h) * BT
+# chunk_kda_bwd_kernel_wy_dqkg_fused_opt_v2优化
+agent分析出的优化点以及收益如下，总时间由159ms优化到84ms
 
-    p_A = tl.make_block_ptr(A + (bos * H + i_h) * BT, (BT, T), (1, H*BT), (0, i_t * BT), (BT, BT), (0, 1))
-    b_A = tl.load(p_A, boundary_check=(0, 1))
+## <font style="color:#000000;">优化点 1：Autotune 配置扩展（AutoTune 自动调优）</font><font style="color:#DF2A3F;">（159->110）</font>
+**<font style="color:#000000;">v0</font>**<font style="color:#000000;">：</font>
 
-    o_t = i_t * BT + tl.arange(0, BT)
-    m_t = o_t < T
-    m_A = (o_t[:, None] <= o_t[None, :]) & (m_t[:, None] & m_t)
-    b_A = tl.where(m_A, b_A, 0).to(do.dtype.element_ty)
-
-    b_dA = tl.zeros([BT, BT], dtype=tl.float32)
-    for i_v in range(tl.cdiv(V, BV)):
-        p_v = tl.make_block_ptr(v, (V, T), (1, H*V), (i_v * BV, i_t * BT), (BV, BT), (0, 1))
-        p_do = tl.make_block_ptr(do, (T, V), (H*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-        p_dv = tl.make_block_ptr(dv, (T, V), (H*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-        # [BV, BT]
-        b_v = tl.load(p_v, boundary_check=(0, 1))
-        # [BT, BV]
-        b_do = tl.load(p_do, boundary_check=(0, 1))
-        # [BT, BT]
-        b_dA += tl.dot(b_do, b_v)
-        # [BT, BV]
-        b_dv = tl.dot(b_A.to(b_do.dtype), b_do)
-        tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), boundary_check=(0, 1))
-
-    p_dA = tl.make_block_ptr(dA, (T, BT), (H*BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
-    b_dA = tl.where(o_t[:, None] >= o_t, b_dA * scale, 0.)
-    tl.store(p_dA, b_dA.to(p_dA.dtype.element_ty), boundary_check=(0, 1))
-
-
-@triton.heuristics({
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
-})
-# @triton.autotune(
-#     configs=[
-#         triton.Config({'BK': BK, 'BV': BV}, num_warps=num_warps, num_stages=num_stages)
-#         for BK in BK_LIST
-#         for BV in BV_LIST
-#         for num_warps in NUM_WARPS
-#         for num_stages in [2, 3, 4]
-#     ],
-#     key=['BT', 'TRANSPOSE_STATE'],
-#     **autotune_cache_kwargs,
-# )
+```python
 @triton.autotune(
     configs=[triton.Config({'BK': 32, 'BV': 32}, num_warps=2, num_stages=3)],
     key=['BT', 'TRANSPOSE_STATE'],
-    **autotune_cache_kwargs,
 )
-@triton.jit(do_not_specialize=['T'])
-def chunk_kda_bwd_kernel_wy_dqkg_fused(
-    q,
-    k,
-    v,
-    v_new,
-    g,
-    beta,
-    A,
-    h,
-    do,
-    dh,
-    dq,
-    dk,
-    dv,
-    dv2,
-    dg,
-    db,
-    dA,
-    cu_seqlens,
-    chunk_indices,
-    scale,
-    T,
-    scalar,
-    H: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BT: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
-    TRANSPOSE_STATE: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-):
-    i_t, i_bh = tl.program_id(0), tl.program_id(1)
-    i_b, i_h = i_bh // H, i_bh % H
+```
 
-    if IS_VARLEN:
-        i_tg = i_t.to(tl.int64)
-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
-        T = (eos - bos).to(tl.int32)
-        NT = tl.cdiv(T, BT)
-    else:
-        NT = tl.cdiv(T, BT)
-        i_tg = (i_b * NT + i_t).to(tl.int64)
-        bos, eos = (i_b * T).to(tl.int64), (i_b * T + T).to(tl.int64)
+**<font style="color:#000000;">v1</font>**<font style="color:#000000;">：</font>
 
-    o_t = i_t * BT + tl.arange(0, BT)
-    m_t = o_t < T
-    m_last = (o_t == min(T, i_t * BT + BT) - 1)
-
-    q += (bos * H + i_h) * K
-    k += (bos * H + i_h) * K
-    v += (bos * H + i_h) * V
-    v_new += (bos * H + i_h) * V
-    g += (bos * H + i_h) * K
-    beta += bos * H + i_h
-    A += (bos * H + i_h) * BT
-    h += (i_tg * H + i_h) * K*V
-    do += (bos * H + i_h) * V
-    dh += (i_tg * H + i_h) * K*V
-    dq += (bos * H + i_h) * K
-    dk += (bos * H + i_h) * K
-    dv += (bos * H + i_h) * V
-    dv2 += (bos * H + i_h) * V
-    dg += (bos * H + i_h) * K
-    db += bos * H + i_h
-    dA += (bos * H + i_h) * BT
-
-    BT_arange = i_t * BT + tl.arange(0, BT)
-    BT_arange_zero_offset = tl.arange(0, BT)
-    BT_mask = (BT_arange < T) & (BT_arange >= 0)
-    BT_mask_zero_offset = (BT_arange_zero_offset < BT) & (BT_arange_zero_offset >= 0)
-    p_beta = beta + BT_arange * H
-    b_beta = tl.load(p_beta, mask = BT_mask, other = 0.)
-    tl.extra.cann.extension.compile_hint(b_beta, "mayDiscretememaccess")
-
-    p_A = A + BT_arange_zero_offset[:, None] + H * BT * BT_arange
-    b_A = tl.load(p_A, mask = BT_mask_zero_offset[:, None] & BT_mask[None, :], other = 0.)
-    tl.extra.cann.extension.compile_hint(b_A, "mayDiscretememaccess")
-
-    b_dA = tl.zeros([BT, BT], dtype=tl.float32)
-    b_db = tl.zeros([BT], dtype=tl.float32)
-
-    for i_k in range(tl.cdiv(K, BK)):
-        BK_arange = i_k * BK + tl.arange(0, BK)
-        BK_mask = (BK_arange < K) & (BK_arange >= 0)
-        o_k = i_k * BK + tl.arange(0, BK)
-        m_k = o_k < K
-
-        p_k = tl.make_block_ptr(k, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-        p_g = tl.make_block_ptr(g, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-        b_k = tl.load(p_k, boundary_check=(0, 1), padding_option="zero")
-        b_g = tl.load(p_g, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
-
-        p_gn = g + (min(T, i_t * BT + BT) - 1).to(tl.int64) * H*K + o_k
-        b_gn = tl.load(p_gn, mask=m_k, other=0).to(tl.float32)
-        b_gn = tl.where(m_k, b_gn, 0)
-
-        b_dq = tl.zeros([BT, BK], dtype=tl.float32)
-        b_dk = tl.zeros([BT, BK], dtype=tl.float32)
-        b_dw = tl.zeros([BT, BK], dtype=tl.float32)
-        b_dgk = tl.zeros([BK], dtype=tl.float32)
-
-        for i_v in range(tl.cdiv(V, BV)):
-            BV_arange = i_v * BV + tl.arange(0, BV)
-            BV_mask = (BV_arange < V) & (BV_arange >= 0)
-            p_v_new = v_new + BT_arange[:, None] * H*V + BV_arange
-            p_do = do + BT_arange[:, None] * H*V + BV_arange
-            if TRANSPOSE_STATE:
-                p_h = tl.make_block_ptr(h, (V, K), (K, 1), (i_v * BV, i_k * BK), (BV, BK), (1, 0))
-                p_dh = tl.make_block_ptr(dh, (V, K), (K, 1), (i_v * BV, i_k * BK), (BV, BK), (1, 0))
-            else:
-                p_h = tl.make_block_ptr(h, (V, K), (1, V), (i_v * BV, i_k * BK), (BV, BK), (0, 1))
-                p_dh = tl.make_block_ptr(dh, (V, K), (1, V), (i_v * BV, i_k * BK), (BV, BK), (0, 1))
-            p_dv = dv + BT_arange[:, None] * H*V + BV_arange
-            # [BT, BV]
-            b_v_new = tl.load(p_v_new, mask= BT_mask[:,None] & BV_mask[None, :])
-            tl.extra.cann.extension.compile_hint(b_v_new, "mayDiscretememaccess")
-            b_v_new = tl.where(BT_mask[:,None] & BV_mask[None, :], b_v_new, 0)
-            b_do = tl.load(p_do, mask= BT_mask[:,None] & BV_mask[None, :])
-            tl.extra.cann.extension.compile_hint(b_do, "mayDiscretememaccess")
-            b_do = tl.where(BT_mask[:,None] & BV_mask[None, :], b_do, 0)
-            # [BV, BK]
-            b_h = tl.load(p_h, boundary_check=(0, 1))
-            tl.extra.cann.extension.compile_hint(b_h, "mayDiscretememaccess")
-            b_dh = tl.load(p_dh, boundary_check=(0, 1))
-            tl.extra.cann.extension.compile_hint(b_dh, "mayDiscretememaccess")
-            # [BT, BV]
-            b_dv = tl.load(p_dv, mask= BT_mask[:,None] & BV_mask[None, :])
-            tl.extra.cann.extension.compile_hint(b_dv, "mayDiscretememaccess")
-
-            b_dgk += tl.sum(b_h * b_dh, axis=0)
-            b_dq += tl.dot(b_do, b_h.to(b_do.dtype)) * scalar
-            b_dk += tl.dot(b_v_new, b_dh.to(b_v_new.dtype)) * scalar
-            b_dw += tl.dot(b_dv.to(b_v_new.dtype), b_h.to(b_v_new.dtype)) * scalar
-            tl.debug_barrier()  # DO NOT REMOVE THIS LINE!
-            if i_k == 0:
-                p_v = v + BT_arange[:, None] * H*V + BV_arange
-                p_dv2_block = tl.make_block_ptr(dv2, (T, V), (H*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-
-                b_v = tl.load(p_v, mask = BT_mask[:, None] & BV_mask[None, :], other = 0.0)
-
-                b_dA += tl.dot(b_dv, tl.trans(b_v))  * scalar
-
-                b_dvb = tl.dot(b_A, b_dv)
-                b_dv2 = b_dvb * b_beta[:, None]
-                b_db += tl.sum(b_dvb * b_v, 1)
-                casted_b_dv2 = b_dv2.to(p_dv2_block.dtype.element_ty)
-                tl.store(p_dv2_block, casted_b_dv2, boundary_check=(0, 1))
-
-        b_gk_exp = exp2(b_g)
-        b_gb = b_gk_exp * b_beta[:, None]
-        b_dgk *= exp2(b_gn)
-        b_dq = b_dq * b_gk_exp * scale
-        b_dk = b_dk * tl.where(m_t[:, None], exp2(b_gn[None, :] - b_g), 0)
-
-        b_kg = b_k * b_gk_exp
-
-        b_dw = -b_dw.to(b_A.dtype)
-        b_dA += tl.dot(b_dw, tl.trans(b_kg.to(b_A.dtype))) * scalar
-
-        b_dkgb = tl.dot(b_A, b_dw)
-        b_db += tl.sum(b_dkgb * b_kg, 1)
-
-        p_q = tl.make_block_ptr(q, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-        b_q = tl.load(p_q, boundary_check=(0, 1), padding_option="zero")
-        tl.extra.cann.extension.compile_hint(b_q, "mayDiscretememaccess")
-        b_kdk = b_k * b_dk
-        b_dgk += tl.sum(b_kdk, axis=0)
-        b_dg = b_q * b_dq - b_kdk + m_last[:, None] * b_dgk + b_kg * b_dkgb * b_beta[:, None]
-        b_dk = b_dk + b_dkgb * b_gb
-
-        p_dq_block = tl.make_block_ptr(dq, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-        p_dk_block = tl.make_block_ptr(dk, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-        p_dg_block = tl.make_block_ptr(dg, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-
-        casted_b_dq = b_dq.to(p_dq_block.dtype.element_ty)
-        tl.store(p_dq_block, casted_b_dq, boundary_check=(0, 1))
-        casted_b_dk = b_dk.to(p_dk_block.dtype.element_ty)
-        tl.store(p_dk_block, casted_b_dk, boundary_check=(0, 1))
-        casted_b_dg = b_dg.to(p_dg_block.dtype.element_ty)
-        tl.store(p_dg_block, casted_b_dg, boundary_check=(0, 1))
-
-    m_A = (o_t[:, None] > o_t[None, :]) & (m_t[:, None] & m_t)
-    b_dA = tl.where(m_A, b_dA * b_beta[None, :], 0)
-    b_dA = tl.dot(b_dA.to(b_A.dtype), b_A)
-    b_dA = tl.dot(b_A, b_dA.to(b_A.dtype))
-    b_dA = tl.where(m_A, -b_dA, 0)
-
-    p_dA = tl.make_block_ptr(dA, (T, BT), (H * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
-    p_db = tl.make_block_ptr(db, (T,), (H,), (i_t * BT,), (BT,), (0,))
-    casted_b_dA = b_dA.to(p_dA.dtype.element_ty)
-    tl.extra.cann.extension.compile_hint(casted_b_dA, "mayDiscretememaccess")
-    tl.store(p_dA, casted_b_dA, boundary_check=(0, 1))
-    casted_b_db = b_db.to(p_db.dtype.element_ty)
-    tl.extra.cann.extension.compile_hint(casted_b_db, "mayDiscretememaccess")
-    tl.store(p_db, casted_b_db, boundary_check=(0,))
-
+```python
 def get_autotune_configs():
     return [
-        triton.Config({'BK': 32, 'BV': 64, 'multibuffer': False}, num_warps=2, num_stages=3),
+        triton.Config({'BK': 32, 'BV': 32, 'multibuffer': False}),
+        triton.Config({'BK': 32, 'BV': 32, 'multibuffer': True}),
+        triton.Config({'BK': 64, 'BV': 64, 'multibuffer': False}),
+        triton.Config({'BK': 64, 'BV': 64, 'multibuffer': True}),
+        triton.Config({'BK': 128, 'BV': 64, 'multibuffer': False}),
+        triton.Config({'BK': 128, 'BV': 64, 'multibuffer': True}),
+        triton.Config({'BK': 64, 'BV': 128, 'multibuffer': False}),
+        triton.Config({'BK': 64, 'BV': 128, 'multibuffer': True}),
     ]
+```
 
-@triton.autotune(
-    configs=get_autotune_configs(),
-    key=['BT', 'TRANSPOSE_STATE'],
-    reset_to_zero=['dq', 'dk', 'dv2', 'db', 'dg', 'dA'],
-    **autotune_cache_kwargs,
-)
-@triton.heuristics({
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
-})
-@triton.jit(do_not_specialize=['T'])
-def chunk_kda_bwd_kernel_wy_dqkg_fused_opt_v2(
-    q,              # [B, T, H, K]
-    k,              # [B, T, H, K]
-    v,              # [B, T, H, V]
-    v_new,          # [B, T, H, V]
-    g,              # [B, T, H, K]
-    beta,           # [B, T, H]
-    A,              # [B, T, H, BT]
-    h,              # [1, 128, H, K, V]
-    do,             # [B, T, H, V]
-    dh,             # [B, 128, H, K, V]
-    dq,             # [B, T, H, K]
-    dk,             # [B, T, H, K]
-    dv,             # [B, T, H, V], input
-    dv2,            # [B, T, H, V], output
-    dg,             # [B, T, H, K]
-    db,             # [B, T, H]
-    dA,             # [B, T, H, BT]
-    cu_seqlens,     # [4]
-    chunk_indices,  # [128, 2]
-    scale,          # float
-    T,              # int
-    NT,
-    scalar,         # float
-    H: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BT: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
-    TRANSPOSE_STATE: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    stride_hz: tl.constexpr,      # int, = B*T (non-varlen) or total_len (varlen)
-):
-    pid = tl.program_id(0)
-    i_bh = pid // NT
-    i_t = pid - i_bh * NT
-    i_b = i_bh // H
-    i_h = i_bh - i_b * H
+**<font style="color:#000000;">收益原因</font>**<font style="color:#000000;">：</font>
 
-    if IS_VARLEN:
-        i_tg = i_t.to(tl.int64)
-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
-        T = (eos - bos).to(tl.int32)
-        NT = tl.cdiv(T, BT)
-    else:
-        NT = tl.cdiv(T, BT)
-        i_tg = (i_b * NT + i_t).to(tl.int64)
-        bos, eos = (i_b * T).to(tl.int64), (i_b * T + T).to(tl.int64)
++ **<font style="color:#000000;">Tiling 参数搜索空间扩展</font>**<font style="color:#000000;">：v0 只有 1 个固定配置 </font>`<font style="color:#000000;">BK=32, BV=32</font>`<font style="color:#000000;">，无法适配不同 K/V 维度下的最优分块。v1 用 8 个配置覆盖 </font>`<font style="color:#000000;">BK/BV ∈ {32, 64, 128}</font>`<font style="color:#000000;"> 的组合，autotune 会自动选出实际延迟最低的配置。</font>
++ **<font style="color:#000000;">不同 K/V 维度对最优 BLOCK_SIZE 敏感</font>**<font style="color:#000000;">：当 K 较大时，增大 BK 可以减少外层循环 </font>`<font style="color:#000000;">i_k</font>`<font style="color:#000000;"> 的迭代次数；当 V 较大时，增大 BV 减少内层循环 </font>`<font style="color:#000000;">i_v</font>`<font style="color:#000000;"> 的迭代次数。不同 shape 的最优 Tiling 差异巨大，固定参数会严重劣化部分场景。</font>
 
-    o_t = i_t * BT + tl.arange(0, BT)
-    m_t = o_t.to(tl.float32) < T.to(tl.float32)
-    m_last = (o_t == min(T, i_t * BT + BT) - 1)
+---
 
-    q += (i_h * stride_hz + bos) * K
-    k += (bos * H + i_h) * K
-    v += (bos * H + i_h) * V
-    v_new += (i_h * stride_hz + bos) * V
-    g += (bos * H + i_h) * K
-    beta += i_h * stride_hz + bos
-    A += (i_h * stride_hz + bos) * BT
-    h += (i_tg * H + i_h) * K*V
-    do += (i_h * stride_hz + bos) * V
-    dh += (i_tg * H + i_h) * K*V
-    dq += (bos * H + i_h) * K
-    dk += (bos * H + i_h) * K
-    dv += (bos * H + i_h) * V
-    dv2 += (bos * H + i_h) * V
-    dg += (bos * H + i_h) * K
-    db += i_h * stride_hz + bos
-    dA += (i_h * stride_hz + bos) * BT
+## <font style="color:#000000;">优化点 2：移除 </font>`<font style="color:#000000;">num_warps</font>`<font style="color:#000000;"> 和 </font>`<font style="color:#000000;">num_stages</font>`<font style="color:#000000;">（GPU 概念不适用）</font>
+**<font style="color:#000000;">v0</font>**<font style="color:#000000;"> </font><font style="color:#000000;">→</font><font style="color:#000000;"> </font>**<font style="color:#000000;">v1</font>**<font style="color:#000000;">：</font>`<font style="color:#000000;">num_warps=2, num_stages=3</font>`<font style="color:#000000;"> </font><font style="color:#000000;">被完全移除。</font>
 
-    BT_arange = i_t * BT + tl.arange(0, BT)
-    BT_arange_zero_offset = tl.arange(0, BT)
-    BT_mask = BT_arange.to(tl.float32) < T.to(tl.float32)
-    p_beta = beta + BT_arange
-    b_beta = tl.load(p_beta, mask = BT_mask, other = 0.)
+**<font style="color:#000000;">收益原因</font>**<font style="color:#000000;">：</font>
 
-    p_A = tl.make_block_ptr(A, (BT, T), (1, BT), (0, i_t * BT), (BT, BT), (0, 1))
-    b_A = tl.load(p_A, boundary_check=(0, 1), padding_option="zero")
++ `<font style="color:#000000;">num_warps</font>`<font style="color:#000000;"> </font><font style="color:#000000;">和</font><font style="color:#000000;"> </font>`<font style="color:#000000;">num_stages</font>`<font style="color:#000000;"> </font><font style="color:#000000;">是</font><font style="color:#000000;"> </font>**<font style="color:#000000;">GPU CUDA 编程模型</font>**<font style="color:#000000;">下的概念（warp 调度、软件流水线级数），在 Ascend NPU 的 Vector/Cube 架构下</font>**<font style="color:#000000;">不具备等价语义</font>**<font style="color:#000000;">。</font>
++ <font style="color:#000000;">保留这些参数不会带来收益，反而可能干扰 Ascend 后端的编译策略。移除后编译器可使用 Ascend 原生的分核和流水线策略。</font>
 
-    b_dA = tl.zeros([BT, BT], dtype=tl.float32)
-    b_db = tl.zeros([BT], dtype=tl.float32)
+---
 
-    for i_k in range(tl.cdiv(K, BK)):
-        BK_arange = i_k * BK + tl.arange(0, BK)
-        BK_mask = BK_arange < K
-        o_k = i_k * BK + tl.arange(0, BK)
-        m_k = o_k < K
+## <font style="color:#000000;">优化点 3：</font>`<font style="color:#000000;">multibuffer</font>`<font style="color:#000000;"> </font><font style="color:#000000;">编译参数（Double Buffer 优化）</font>
+**<font style="color:#000000;">v1 新增</font>**<font style="color:#000000;">：每个 Config 都包含</font><font style="color:#000000;"> </font>`<font style="color:#000000;">multibuffer: True/False</font>`<font style="color:#000000;"> </font><font style="color:#000000;">两种变体。</font>
 
-        b_dq = tl.zeros([BT, BK], dtype=tl.float32)
-        b_dk = tl.zeros([BT, BK], dtype=tl.float32)
-        b_dw = tl.zeros([BT, BK], dtype=tl.float32)
-        b_dgk = tl.zeros([BK], dtype=tl.float32)
+**<font style="color:#000000;">收益原因</font>**<font style="color:#000000;">：</font>
 
-        for i_v in range(tl.cdiv(V, BV)):
-            BV_arange = i_v * BV + tl.arange(0, BV)
-            BV_mask = BV_arange < V
-            mask_bt_bv = BT_mask[:, None] & BV_mask[None, :]
-            p_v_new = v_new + BT_arange[:, None] * V + BV_arange
-            p_do = do + BT_arange[:, None] * V + BV_arange
-            if TRANSPOSE_STATE:
-                p_h = tl.make_block_ptr(h, (V, K), (K, 1), (i_v * BV, i_k * BK), (BV, BK), (1, 0))
-                p_dh = tl.make_block_ptr(dh, (V, K), (K, 1), (i_v * BV, i_k * BK), (BV, BK), (1, 0))
-            else:
-                p_h = tl.make_block_ptr(h, (V, K), (1, V), (i_v * BV, i_k * BK), (BV, BK), (0, 1))
-                p_dh = tl.make_block_ptr(dh, (V, K), (1, V), (i_v * BV, i_k * BK), (BV, BK), (0, 1))
-            p_dv = dv + BT_arange[:, None] * H*V + BV_arange
-            # [BT, BV] — load b_dv first (used in 3 cube + 1 vector op)
-            b_dv = tl.load(p_dv, mask=mask_bt_bv, other=0)
-            tl.extra.cann.extension.compile_hint(b_dv, "mayDiscretememaccess")
-            # [BT, BV]
-            b_v_new = tl.load(p_v_new, mask=mask_bt_bv, other=0)
-            tl.extra.cann.extension.compile_hint(b_v_new, "mayDiscretememaccess")
-            b_do = tl.load(p_do, mask=mask_bt_bv, other=0)
-            tl.extra.cann.extension.compile_hint(b_do, "mayDiscretememaccess")
-            # [BV, BK]
-            b_h = tl.load(p_h, boundary_check=(0, 1))
-            b_dh = tl.load(p_dh, boundary_check=(0, 1))
++ **<font style="color:#000000;">双缓冲（Double Buffer）</font>**<font style="color:#000000;">：开启</font><font style="color:#000000;"> </font>`<font style="color:#000000;">multibuffer</font>`<font style="color:#000000;"> </font><font style="color:#000000;">后，编译器在 UB（Unified Buffer）中分配双倍空间，当前数据块的计算与下一数据块的加载可以</font>**<font style="color:#000000;">重叠执行</font>**<font style="color:#000000;">，隐藏访存延迟。</font>
++ <font style="color:#000000;">本 kernel 有大量 </font>`<font style="color:#000000;">tl.load</font>`<font style="color:#000000;"> + </font>`<font style="color:#000000;">tl.dot</font>`<font style="color:#000000;"> 的循环模式，属于典型的 Cube 计算与 Vector 加载可并行场景，双缓冲带来的流水线并行收益显著。</font>
 
-            b_dq += tl.dot(b_do, b_h.to(b_do.dtype))
-            b_dw += tl.dot(b_dv.to(b_v_new.dtype), b_h.to(b_v_new.dtype))
-            b_dk += tl.dot(b_v_new, b_dh.to(b_v_new.dtype))
-            b_dgk += tl.sum(b_h * b_dh, axis=0)
-            if i_k == 0:
-                p_v = v + BT_arange[:, None] * H*V + BV_arange
-                p_dv2_block = tl.make_block_ptr(dv2, (T, V), (H*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
+---
 
-                b_v = tl.load(p_v, mask=mask_bt_bv, other = 0.0)
-                tl.extra.cann.extension.compile_hint(b_v, "mayDiscretememaccess")
+## <font style="color:#000000;">优化点 4：整数比较 → FP32 比较（向量比较优化 / Vector Compare）</font><font style="color:#DF2A3F;">（110->80）</font>
+**<font style="color:#000000;">v0</font>**<font style="color:#000000;">：</font>
 
-                b_dA += tl.dot(b_dv, tl.trans(b_v)) * scalar
+```python
+m_t = o_t < T                              # int comparison
+m_A = (o_t[:, None] > o_t[None, :]) & ...  # int comparison
+```
 
-                b_dvb = tl.dot(b_A, b_dv)
-                b_dv2 = b_dvb * b_beta[:, None]
-                b_db += tl.sum(b_dvb * b_v, 1)
-                casted_b_dv2 = b_dv2.to(p_dv2_block.dtype.element_ty)
-                tl.store(p_dv2_block, casted_b_dv2, boundary_check=(0, 1))
+**<font style="color:#000000;">v1</font>**<font style="color:#000000;">：</font>
 
-        p_k = tl.make_block_ptr(k, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-        p_g = tl.make_block_ptr(g, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-        b_k = tl.load(p_k, boundary_check=(0, 1), padding_option="zero")
-        tl.extra.cann.extension.compile_hint(b_k, "mayDiscretememaccess")
-        b_g = tl.load(p_g, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
-        p_gn = g + (min(T, i_t * BT + BT) - 1).to(tl.int64) * H*K + o_k
-        b_gn = tl.load(p_gn, mask=m_k, other=0).to(tl.float32)
+```python
+m_t = o_t.to(tl.float32) < T.to(tl.float32)                              # fp32 comparison
+m_A = (o_t[:, None].to(tl.float32) > o_t[None, :].to(tl.float32)) & ...  # fp32 comparison
+```
 
-        b_gk_exp = tl.math.exp2(b_g)
-        b_gb = b_gk_exp * b_beta[:, None]
-        b_dgk *= tl.math.exp2(b_gn)
-        b_dq = b_dq * b_gk_exp * (scale * scalar)
-        b_dk = b_dk * tl.where(m_t[:, None], tl.math.exp2(b_gn[None, :] - b_g) * scalar, 0)
+**<font style="color:#000000;">收益原因</font>**<font style="color:#000000;">：</font>
 
-        b_kg = b_k * b_gk_exp
++ <font style="color:#000000;">Ascend NPU 的 Vector 处理器</font>**<font style="color:#000000;">不支持整数的向量比较指令</font>**<font style="color:#000000;">（仅支持 i32 的 EQ/NE 和浮点比较），</font>`<font style="color:#000000;">i64</font>`<font style="color:#000000;">/整数的大小比较会被</font>**<font style="color:#000000;">标量降级</font>**<font style="color:#000000;">（scalar lowering），逐元素串行执行，性能损失</font><font style="color:#000000;"> </font>**<font style="color:#000000;">10-100 倍</font>**<font style="color:#000000;">。</font>
++ <font style="color:#000000;">转为 fp32 后可使用 VPFCMP 指令进行向量化并行比较，一条指令处理整个向量块。</font>
 
-        b_dw = -(b_dw * scalar).to(b_A.dtype)
-        b_dA += tl.dot(b_dw, tl.trans(b_kg.to(b_A.dtype))) * scalar
+---
 
-        b_dkgb = tl.dot(b_A, b_dw)
-        b_db += tl.sum(b_dkgb * b_kg, 1)
+## <font style="color:#000000;">优化点 5：冗余</font><font style="color:#000000;"> </font>`<font style="color:#000000;">>= 0</font>`<font style="color:#000000;"> </font><font style="color:#000000;">mask 消除（边界运算简化）</font>
+**<font style="color:#000000;">v0</font>**<font style="color:#000000;">：</font>
 
-        b_kdk = b_k * b_dk
-        b_dgk += tl.sum(b_kdk, axis=0)
-        p_q = tl.make_block_ptr(q, (T, K), (K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-        b_q = tl.load(p_q, boundary_check=(0, 1), padding_option="zero")
-        tl.extra.cann.extension.compile_hint(b_q, "mayDiscretememaccess")
-        b_dg = b_q * b_dq - b_kdk + m_last[:, None] * b_dgk + b_kg * b_dkgb * b_beta[:, None]
-        b_dk = b_dk + b_dkgb * b_gb
+```python
+BK_mask = (BK_arange < K) & (BK_arange >= 0)
+BV_mask = (BV_arange < V) & (BV_arange >= 0)
+BT_mask = (BT_arange < T) & (BT_arange >= 0)
+```
 
-        p_dq_block = tl.make_block_ptr(dq, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-        p_dk_block = tl.make_block_ptr(dk, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-        p_dg_block = tl.make_block_ptr(dg, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+**<font style="color:#000000;">v1</font>**<font style="color:#000000;">：</font>
 
-        casted_b_dq = b_dq.to(p_dq_block.dtype.element_ty)
-        tl.store(p_dq_block, casted_b_dq, boundary_check=(0, 1))
-        casted_b_dk = b_dk.to(p_dk_block.dtype.element_ty)
-        tl.store(p_dk_block, casted_b_dk, boundary_check=(0, 1))
-        casted_b_dg = b_dg.to(p_dg_block.dtype.element_ty)
-        tl.store(p_dg_block, casted_b_dg, boundary_check=(0, 1))
+```python
+BK_mask = BK_arange < K
+BV_mask = BV_arange < V
+BT_mask = BT_arange.to(tl.float32) < T.to(tl.float32)
+```
 
-    m_A = (o_t[:, None].to(tl.float32) > o_t[None, :].to(tl.float32)) & (m_t[:, None] & m_t)
-    b_dA = tl.where(m_A, b_dA * b_beta[None, :], 0)
-    b_dA = tl.dot(b_dA.to(b_A.dtype), b_A)
-    b_dA = tl.dot(b_A, b_dA.to(b_A.dtype))
-    b_dA = tl.where(m_A, -b_dA, 0)
+**<font style="color:#000000;">收益原因</font>**<font style="color:#000000;">：</font>
 
-    p_dA = tl.make_block_ptr(dA, (T, BT), (BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
-    p_db = tl.make_block_ptr(db, (T,), (1,), (i_t * BT,), (BT,), (0,))
-    casted_b_dA = b_dA.to(p_dA.dtype.element_ty)
-    tl.store(p_dA, casted_b_dA, boundary_check=(0, 1))
-    casted_b_db = b_db.to(p_db.dtype.element_ty)
-    tl.store(p_db, casted_b_db, boundary_check=(0,))
++ `<font style="color:#000000;">tl.arange(0, BK)</font>`<font style="color:#000000;"> </font><font style="color:#000000;">产生的值</font>**<font style="color:#000000;">恒 ≥ 0</font>**<font style="color:#000000;">，</font>`<font style="color:#000000;">BK_arange >= 0</font>`<font style="color:#000000;"> </font><font style="color:#000000;">永远为 True，属于冗余条件。</font>
++ <font style="color:#000000;">冗余 mask 带来</font>**<font style="color:#000000;">两次额外开销</font>**<font style="color:#000000;">：(1) 多一次比较运算；(2)</font><font style="color:#000000;"> </font>`<font style="color:#000000;">&</font>`<font style="color:#000000;"> </font><font style="color:#000000;">操作将两个 mask 合并时产生额外的逐元素与运算。</font>
++ <font style="color:#000000;">移除后减少运算量，同时也减少了标量降级的风险（整数</font><font style="color:#000000;"> </font>`<font style="color:#000000;">&</font>`<font style="color:#000000;"> </font><font style="color:#000000;">操作可能在特定条件下降级）。</font>
++ <font style="color:#000000;">参考</font><font style="color:#000000;"> </font>`<font style="color:#000000;">latency-optimizer/references/redundant_boundary_operation.md</font>`<font style="color:#000000;">：KVR（Known-Value Region）分析框架——已知的恒真条件不应参与 mask 计算。</font>
 
+---
 
+## <font style="color:#000000;">优化点 6：</font>`<font style="color:#000000;">BT_mask_zero_offset</font>`<font style="color:#000000;"> </font><font style="color:#000000;">完全消除</font>
+**<font style="color:#000000;">v0</font>**<font style="color:#000000;">：</font>
 
-def chunk_kda_bwd_dAv(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    do: torch.Tensor,
-    A: torch.Tensor | None = None,
-    scale: float = None,
-    cu_seqlens: torch.LongTensor | None = None,
-    chunk_size: int = 64,
-    chunk_indices: torch.LongTensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    B, T, H, K, V = *k.shape, do.shape[-1]
-    BT = chunk_size
-    if chunk_indices is None and cu_seqlens is not None:
-        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
-    # H100 can have larger block size
-    if check_shared_mem('hopper', k.device.index):
-        CONST_TILING = 128
-    elif check_shared_mem:
-        CONST_TILING = 64
-    else:
-        CONST_TILING = 32
-    BK = min(max(triton.next_power_of_2(K), 16), CONST_TILING)
-    BV = min(max(triton.next_power_of_2(V), 16), CONST_TILING)
-    NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
+```python
+BT_mask_zero_offset = (BT_arange_zero_offset < BT) & (BT_arange_zero_offset >= 0)
+# 用于 b_A 加载: mask = BT_mask_zero_offset[:, None] & BT_mask[None, :]
+```
 
-    dA = v.new_empty(B, T, H, BT, dtype=torch.float)
-    dv = torch.empty_like(do)
-    grid = (NT, B * H)
-    chunk_kda_bwd_kernel_dAv[grid](
-        q=q,
-        k=k,
-        v=v,
-        A=A,
-        do=do,
-        dv=dv,
-        dA=dA,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        scale=scale,
-        T=T,
-        H=H,
-        K=K,
-        V=V,
-        BT=BT,
-        BK=BK,
-        BV=BV,
-    )
-    return dA, dv
+**<font style="color:#000000;">v1</font>**<font style="color:#000000;">：</font>`<font style="color:#000000;">BT_mask_zero_offset</font>`<font style="color:#000000;"> </font><font style="color:#000000;">变量完全删除，</font>`<font style="color:#000000;">b_A</font>`<font style="color:#000000;"> </font><font style="color:#000000;">加载仅用</font><font style="color:#000000;"> </font>`<font style="color:#000000;">BT_mask[None, :]</font>`<font style="color:#000000;">。</font>
 
+**<font style="color:#000000;">收益原因</font>**<font style="color:#000000;">：</font>
 
-def chunk_kda_bwd_wy_dqkg_fused(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    v_new: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    A: torch.Tensor,
-    h: torch.Tensor,
-    do: torch.Tensor,
-    dh: torch.Tensor,
-    dv: torch.Tensor,
-    scale: float | None = None,
-    cu_seqlens: torch.LongTensor | None = None,
-    chunk_size: int = 64,
-    chunk_indices: torch.LongTensor | None = None,
-    transpose_state_layout: bool = False,
-):
-    B, T, H, K, V = *k.shape, v.shape[-1]
-    BT = chunk_size
++ `<font style="color:#000000;">BT_arange_zero_offset = tl.arange(0, BT)</font>`<font style="color:#000000;">，而 BT 是</font><font style="color:#000000;"> </font>`<font style="color:#000000;">tl.constexpr</font>`<font style="color:#000000;">，所以</font><font style="color:#000000;"> </font>`<font style="color:#000000;">tl.arange(0, BT) < BT</font>`<font style="color:#000000;"> </font>**<font style="color:#000000;">恒为 True</font>**<font style="color:#000000;">。</font>
++ `<font style="color:#000000;">>= 0</font>`<font style="color:#000000;"> </font><font style="color:#000000;">同理恒真。整个</font><font style="color:#000000;"> </font>`<font style="color:#000000;">BT_mask_zero_offset</font>`<font style="color:#000000;"> </font><font style="color:#000000;">是全 True mask，与任何 mask 做</font><font style="color:#000000;"> </font>`<font style="color:#000000;">&</font>`<font style="color:#000000;"> </font><font style="color:#000000;">不改变结果。</font>
++ <font style="color:#000000;">消除后：(1) 减少一次比较 + 一次与运算；(2)</font><font style="color:#000000;"> </font>`<font style="color:#000000;">b_A</font>`<font style="color:#000000;"> </font><font style="color:#000000;">加载的 mask 更简单，编译器更容易优化。</font>
 
-    if chunk_indices is None and cu_seqlens is not None:
-        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
-    NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
+---
 
-    dq = torch.empty_like(q, dtype=torch.float)
-    dk = torch.empty_like(k, dtype=torch.float)
-    dv2 = torch.empty_like(v)
-    dg = torch.empty_like(g, dtype=torch.float)
-    # db = torch.empty_like(beta, dtype=torch.float)
-    # dA = torch.empty_like(A, dtype=torch.float)
-    scalar = 1.0
+## <font style="color:#000000;">优化点 7：Load 指令重排序（Load Order Optimization）</font>
+**<font style="color:#000000;">v0</font>**<font style="color:#000000;">（inner loop 内的加载顺序）：</font>
 
-    stride_hz = B * T
-    beta_t = torch.permute(beta, (2, 0, 1)).contiguous()
-    A_t = torch.permute(A, (2, 0, 1, 3)).contiguous()
-    v_new_t = torch.permute(v_new, (2, 0, 1, 3)).contiguous()
-    do_t = torch.permute(do, (2, 0, 1, 3)).contiguous()
-    q_t = torch.permute(q, (2, 0, 1, 3)).contiguous()
+```python
+# 先加载手动指针数据
+b_v_new = tl.load(p_v_new, mask=...)  # manual ptr
+b_do = tl.load(p_do, mask=...)        # manual ptr
+# 再加载 block_ptr 数据
+b_h = tl.load(p_h, ...)               # block_ptr
+b_dh = tl.load(p_dh, ...)             # block_ptr
+b_dv = tl.load(p_dv, mask=...)        # manual ptr
+```
 
-    dA_t = torch.zeros([H, B, T, BT], dtype=torch.float32, device=q.device)
-    db_t = torch.zeros([H, B, T], dtype=torch.float32, device=q.device)
+**<font style="color:#000000;">v1</font>**<font style="color:#000000;">：</font>
 
+```python
+# 先加载 block_ptr 数据（与上一轮 store 无依赖）
+b_h = tl.load(p_h, ...)               # block_ptr
+b_dh = tl.load(p_dh, ...)             # block_ptr
+# 再加载手动指针数据
+b_v_new = tl.load(p_v_new, mask=...)  # manual ptr
+b_do = tl.load(p_do, mask=...)        # manual ptr
+b_dv = tl.load(p_dv, mask=...)        # manual ptr
+```
 
-    grid = (NT * B * H,)
-    # save_dict = {
-    #     # 张量输入
-    #     'q': q_t,
-    #     'k': k,
-    #     'v': v,
-    #     'v_new': v_new_t,
-    #     'g': g,
-    #     'beta': beta_t,
-    #     'A': A_t,
-    #     'h': h,
-    #     'do': do_t,
-    #     'dh': dh,
-    #     'dq': dq,
-    #     'dk': dk,
-    #     'dv': dv,
-    #     'dv2': dv2,
-    #     'dg': dg,
-    #     'db': db_t,
-    #     'dA': dA_t,
-    #     # 可能为 None 的张量
-    #     'cu_seqlens': cu_seqlens,
-    #     'chunk_indices': chunk_indices,
-    #     # 标量参数
-    #     'scale': scale,
-    #     'T': T,
-    #     'scalar': scalar,
-    #     'H': H,
-    #     'K': K,
-    #     'V': V,
-    #     'BT': BT,
-    #     'TRANSPOSE_STATE': transpose_state_layout,
-    #     'stride_hz': stride_hz,
-    #     'grid': grid,
-    # }
-    # save_path = "/home/z00841464/AR/workspace/data/chunk_kda_bwd_kernel_wy_dqkg_fused_kimi.pkl"
-    # import pickle
-    # with open(save_path, "wb") as f:
-    #     pickle.dump(save_dict, f)
-    # print(f"Saved all kernel inputs to {save_path}")
-    
-    chunk_kda_bwd_kernel_wy_dqkg_fused_opt_v2[grid](
-        q=q_t,
-        k=k,
-        v=v,
-        v_new=v_new_t,
-        g=g,
-        beta=beta_t,
-        A=A_t,
-        h=h,
-        do=do_t,
-        dh=dh,
-        dq=dq,
-        dk=dk,
-        dv=dv,
-        dv2=dv2,
-        dg=dg,
-        db=db_t,
-        dA=dA_t,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        scale=scale,
-        T=T,
-        NT=NT,
-        scalar=scalar,
-        H=H,
-        K=K,
-        V=V,
-        BT=BT,
-        TRANSPOSE_STATE=transpose_state_layout,
-        stride_hz=stride_hz,
-    )
-    db = torch.permute(db_t, (1, 2, 0)).contiguous()
-    dA = torch.permute(dA_t, (1, 2, 0, 3)).contiguous()
+**<font style="color:#000000;">收益原因</font>**<font style="color:#000000;">：</font>
 
-    dv = dv2
-    return dq, dk, dv, db, dg, dA
++ <font style="color:#000000;">内层循环</font><font style="color:#000000;"> </font>`<font style="color:#000000;">for i_v</font>`<font style="color:#000000;"> </font><font style="color:#000000;">中，</font>`<font style="color:#000000;">b_h</font>`<font style="color:#000000;">/</font>`<font style="color:#000000;">b_dh</font>`<font style="color:#000000;"> </font><font style="color:#000000;">的地址仅依赖外层变量</font><font style="color:#000000;"> </font>`<font style="color:#000000;">i_k</font>`<font style="color:#000000;">、</font>`<font style="color:#000000;">i_v</font>`<font style="color:#000000;">，与上一轮</font><font style="color:#000000;"> </font>`<font style="color:#000000;">i_v-1</font>`<font style="color:#000000;"> </font><font style="color:#000000;">的 store 操作</font>**<font style="color:#000000;">无 RAW（Read-After-Write）依赖</font>**<font style="color:#000000;">。</font>
++ <font style="color:#000000;">而</font><font style="color:#000000;"> </font>`<font style="color:#000000;">b_v_new</font>`<font style="color:#000000;">/</font>`<font style="color:#000000;">b_do</font>`<font style="color:#000000;"> </font><font style="color:#000000;">的地址虽然也不依赖上一轮的写，但 v0 中先加载它们会使</font><font style="color:#000000;"> </font>`<font style="color:#000000;">b_h</font>`<font style="color:#000000;">/</font>`<font style="color:#000000;">b_dh</font>`<font style="color:#000000;"> </font><font style="color:#000000;">的加载被延迟。</font>
++ **<font style="color:#000000;">将无依赖的 load 提前</font>**<font style="color:#000000;">，可以让它与上一轮的 </font>`<font style="color:#000000;">tl.store</font>`<font style="color:#000000;">（写 </font>`<font style="color:#000000;">dv2</font>`<font style="color:#000000;">）在硬件流水线上并行执行，隐藏访存延迟。</font>
 
+---
 
-    # grid = (NT, B * H)
-    # chunk_kda_bwd_kernel_wy_dqkg_fused[grid](
-    #     q=q,
-    #     k=k,
-    #     v=v,
-    #     v_new=v_new,
-    #     g=g,
-    #     beta=beta,
-    #     A=A,
-    #     h=h,
-    #     do=do,
-    #     dh=dh,
-    #     dq=dq,
-    #     dk=dk,
-    #     dv=dv,
-    #     dv2=dv2,
-    #     dg=dg,
-    #     db=db,
-    #     dA=dA,
-    #     cu_seqlens=cu_seqlens,
-    #     chunk_indices=chunk_indices,
-    #     scale=scale,
-    #     T=T,
-    #     scalar=scalar,
-    #     H=H,
-    #     K=K,
-    #     V=V,
-    #     BT=BT,
-    #     TRANSPOSE_STATE=transpose_state_layout,
-    # )
-    # dv = dv2
-    # return dq, dk, dv, db, dg, dA
+## <font style="color:#000000;">优化点 8：</font>`<font style="color:#000000;">tl.where</font>`<font style="color:#000000;"> </font><font style="color:#000000;">消除 +</font><font style="color:#000000;"> </font>`<font style="color:#000000;">other</font>`<font style="color:#000000;"> </font><font style="color:#000000;">参数（冗余边界运算消除 / KVR）</font>
+**<font style="color:#000000;">v0</font>**<font style="color:#000000;">：</font>
 
+```python
+b_v_new = tl.load(p_v_new, mask=BT_mask[:,None] & BV_mask[None, :])
+b_v_new = tl.where(BT_mask[:,None] & BV_mask[None, :], b_v_new, 0)
 
-def chunk_kda_bwd(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    beta: torch.Tensor,
-    Aqk: torch.Tensor,
-    Akk: torch.Tensor,
-    scale: float,
-    initial_state: torch.Tensor,
-    do: torch.Tensor,
-    dht: torch.Tensor,
-    g: torch.Tensor | None = None,
-    g_org: torch.Tensor | None = None,
-    cu_seqlens: torch.LongTensor | None = None,
-    chunk_indices: torch.LongTensor | None = None,
-    chunk_size: int = 64,
-    safe_gate: bool = False,
-    lower_bound: float | None = None,
-    use_gate_in_kernel: bool = False,
-    A_log: torch.Tensor | None = None,
-    dt_bias: torch.Tensor | None = None,
-    disable_recompute: bool = False,
-    cp_context: FLACPContext | None = None,
-    transpose_state_layout: bool = False,
-    **kwargs,
-):
-    if disable_recompute is False:
-        if use_gate_in_kernel:
-            g = kda_gate_chunk_cumsum(
-                g=g_org,
-                A_log=A_log,
-                dt_bias=dt_bias,
-                scale=RCP_LN2,
-                chunk_size=chunk_size,
-                cu_seqlens=cu_seqlens,
-                chunk_indices=chunk_indices,
-                lower_bound=lower_bound
-            )
-        w, u, qg, kg = recompute_w_u_fwd(
-            q=q,
-            k=k,
-            v=v,
-            beta=beta,
-            A=Akk,
-            gk=g,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-        )
-        if cp_context is not None:
-            # Restore the full initial_state tensor from the compressed version.
-            # Only the first sequence's state is non-zero as it's the only one that could be cross-rank.
-            initial_state = expand_h0(initial_state, context=cp_context)
-        h, v_new, _ = chunk_gated_delta_rule_fwd_h(
-            k=kg,
-            w=w,
-            u=u,
-            gk=g,
-            initial_state=initial_state,
-            output_final_state=False,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-            use_exp2=True,
-            transpose_state_layout=transpose_state_layout,
-        )
-    else:
-        w, u, qg, kg, v_new, h = kwargs["w"], kwargs["u"], kwargs["qg"], kwargs["kg"], kwargs["v_new"], kwargs["h"]
-        if cp_context is not None:
-            # Restore the full initial_state tensor from the compressed version.
-            # Only the first sequence's state is non-zero as it's the only one that could be cross-rank.
-            initial_state = expand_h0(initial_state, context=cp_context)
+b_do = tl.load(p_do, mask=BT_mask[:,None] & BV_mask[None, :])
+b_do = tl.where(BT_mask[:,None] & BV_mask[None, :], b_do, 0)
+```
 
-    # dAqk = do @ v.T
-    # dv = A @ do
-    dAqk, dv = chunk_kda_bwd_dAv(
-        q=q,
-        k=k,
-        v=v_new,
-        do=do,
-        A=Aqk,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-        chunk_size=chunk_size,
-        chunk_indices=chunk_indices,
-    )
+**<font style="color:#000000;">v1</font>**<font style="color:#000000;">：</font>
 
-    if cp_context is not None:
-        # initial_state is None in the CP mode
-        # We only need to compute dht of current rank and pass it to the backward kernel
-        dht, initial_state = chunk_gated_delta_rule_bwd_dhu_pre_process(
-            q=qg,
-            k=kg,
-            w=w,
-            do=do,
-            dv=dv,
-            gk=g,
-            scale=scale,
-            cu_seqlens=cu_seqlens,
-            dht=dht,
-            initial_state=initial_state,
-            use_exp2=True,
-            context=cp_context,
-            transpose_state_layout=transpose_state_layout,
-        )
+```python
+b_v_new = tl.load(p_v_new, mask=BT_mask[:,None] & BV_mask[None, :], other=0)
+b_do = tl.load(p_do, mask=BT_mask[:,None] & BV_mask[None, :], other=0)
+```
 
-    dh, dh0, dv = chunk_gated_delta_rule_bwd_dhu(
-        q=qg,
-        k=kg,
-        w=w,
-        gk=g,
-        h0=initial_state,
-        dht=dht,
-        do=do,
-        dv=dv,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        use_exp2=True,
-        transpose_state_layout=transpose_state_layout,
-    )
+**<font style="color:#000000;">收益原因</font>**<font style="color:#000000;">：</font>
 
-    dq, dk, dv, db, dg, dAkk = chunk_kda_bwd_wy_dqkg_fused(
-        q=q,
-        k=k,
-        v=v,
-        v_new=v_new,
-        g=g,
-        beta=beta,
-        A=Akk,
-        h=h,
-        do=do,
-        dh=dh,
-        dv=dv,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-        chunk_size=chunk_size,
-        chunk_indices=chunk_indices,
-        transpose_state_layout=transpose_state_layout,
-    )
++ `<font style="color:#000000;">tl.load(..., mask=M, other=0)</font>`<font style="color:#000000;"> </font>**<font style="color:#000000;">已经保证</font>**<font style="color:#000000;">了</font><font style="color:#000000;"> </font>`<font style="color:#000000;">M=False</font>`<font style="color:#000000;"> </font><font style="color:#000000;">位置值为 0（KVR：Known-Value Region）。</font>
++ <font style="color:#000000;">随后再执行</font><font style="color:#000000;"> </font>`<font style="color:#000000;">tl.where(M, val, 0)</font>`<font style="color:#000000;"> </font><font style="color:#000000;">是</font>**<font style="color:#000000;">完全冗余的</font>**<font style="color:#000000;">——它把已知为 0 的区域再次设为 0。</font>
++ <font style="color:#000000;">消除 </font>`<font style="color:#000000;">tl.where</font>`<font style="color:#000000;"> 后：(1) 省去一次逐元素条件选择运算；(2) 减少一次 mask 计算和广播；(3) 减少寄存器压力。</font>
 
-    dq, dk, db, dg = chunk_kda_bwd_intra(
-        q=q,
-        k=k,
-        g=g,
-        beta=beta,
-        dAqk=dAqk,
-        dAkk=dAkk,
-        dq=dq,
-        dk=dk,
-        db=db,
-        dg=dg,
-        cu_seqlens=cu_seqlens,
-        chunk_size=chunk_size,
-        chunk_indices=chunk_indices,
-        safe_gate=safe_gate
-    )
+---
 
-    dA, dbias = None, None
-    dg = chunk_local_cumsum(
-        dg,
-        chunk_size=chunk_size,
-        reverse=True,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-    )
-    if use_gate_in_kernel:
-        dg, dA, dbias = kda_gate_bwd(
-            g=g_org,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            dyg=dg,
-            lower_bound=lower_bound
-        )
+## <font style="color:#000000;">优化点 9：</font>`<font style="color:#000000;">b_gn</font>`<font style="color:#000000;"> 加载位置调整 + </font>`<font style="color:#000000;">tl.where</font>`<font style="color:#000000;"> 消除</font><font style="color:#DF2A3F;">（80->70）</font>
+**<font style="color:#000000;">v0</font>**<font style="color:#000000;">（</font>`<font style="color:#000000;">b_gn</font>`<font style="color:#000000;"> </font><font style="color:#000000;">在</font><font style="color:#000000;"> </font>`<font style="color:#000000;">for i_v</font>`<font style="color:#000000;"> </font><font style="color:#000000;">循环之前加载）：</font>
 
-    return dq, dk, dv, db, dg, dh0, dA, dbias
+```python
+# 在 for i_k 内部、for i_v 之前
+p_gn = g + (min(T, i_t * BT + BT) - 1).to(tl.int64) * H*K + o_k
+b_gn = tl.load(p_gn, mask=m_k, other=0).to(tl.float32)
+b_gn = tl.where(m_k, b_gn, 0)  # 冗余 tl.where
+
+for i_v in range(tl.cdiv(V, BV)):
+    ...  # b_gn 未在内层循环中使用
+```
+
+**<font style="color:#000000;">v1</font>**<font style="color:#000000;">（</font>`<font style="color:#000000;">b_gn</font>`<font style="color:#000000;"> </font><font style="color:#000000;">在</font><font style="color:#000000;"> </font>`<font style="color:#000000;">for i_v</font>`<font style="color:#000000;"> </font><font style="color:#000000;">循环之后加载）：</font>
+
+```python
+for i_v in range(tl.cdiv(V, BV)):
+    ...  # 内层循环不涉及 b_gn
+
+# 在 for i_k 内部、for i_v 之后
+p_gn = g + (min(T, i_t * BT + BT) - 1).to(tl.int64) * H*K + o_k
+b_gn = tl.load(p_gn, mask=m_k, other=0).to(tl.float32)
+# 无冗余 tl.where
+```
+
+**<font style="color:#000000;">收益原因</font>**<font style="color:#000000;">：</font>
+
++ **<font style="color:#000000;">位置调整（延迟加载）</font>**<font style="color:#000000;">：</font>`<font style="color:#000000;">b_gn</font>`<font style="color:#000000;"> </font><font style="color:#000000;">仅在</font><font style="color:#000000;"> </font>`<font style="color:#000000;">for i_v</font>`<font style="color:#000000;"> </font><font style="color:#000000;">循环之后的 exp2 计算中使用，提前加载会</font>**<font style="color:#000000;">占据 UB/寄存器空间</font>**<font style="color:#000000;">长达整个内层循环。移到使用点附近，减少 UB 压力，为</font><font style="color:#000000;"> </font>`<font style="color:#000000;">multibuffer</font>`<font style="color:#000000;"> </font><font style="color:#000000;">双缓冲腾出空间。</font>
++ `**<font style="color:#000000;">tl.where</font>**`**<font style="color:#000000;"> </font>****<font style="color:#000000;">消除</font>**<font style="color:#000000;">：同优化点 8，</font>`<font style="color:#000000;">tl.load(..., mask=m_k, other=0)</font>`<font style="color:#000000;"> </font><font style="color:#000000;">已建立 KVR（m_k=False 区域值为 0），</font>`<font style="color:#000000;">tl.where(m_k, b_gn, 0)</font>`<font style="color:#000000;"> </font><font style="color:#000000;">完全冗余。</font>
+
+---
+
+## <font style="color:#000000;">优化点 10：</font>`<font style="color:#000000;">b_dv</font>`<font style="color:#000000;"> </font><font style="color:#000000;">加载添加</font><font style="color:#000000;"> </font>`<font style="color:#000000;">other=0</font>`
+**<font style="color:#000000;">v0</font>**<font style="color:#000000;">：</font>
+
+```python
+b_dv = tl.load(p_dv, mask=BT_mask[:,None] & BV_mask[None, :])
+```
+
+**<font style="color:#000000;">v1</font>**<font style="color:#000000;">：</font>
+
+```python
+b_dv = tl.load(p_dv, mask=BT_mask[:,None] & BV_mask[None, :], other=0)
+```
+
+**<font style="color:#000000;">收益原因</font>**<font style="color:#000000;">：</font>
+
++ <font style="color:#000000;">v0 中未指定</font><font style="color:#000000;"> </font>`<font style="color:#000000;">other</font>`<font style="color:#000000;">，mask 外的值</font>**<font style="color:#000000;">未定义</font>**<font style="color:#000000;">（可能是 UB 中的残留数据），后续</font><font style="color:#000000;"> </font>`<font style="color:#000000;">b_dw += tl.dot(b_dv.to(...), b_h.to(...))</font>`<font style="color:#000000;"> </font><font style="color:#000000;">会将未定义值卷入累加器，导致精度问题。</font>
++ <font style="color:#000000;">添加</font><font style="color:#000000;"> </font>`<font style="color:#000000;">other=0</font>`<font style="color:#000000;"> </font><font style="color:#000000;">后，边界区域值为确定的 0，不参与 dot 乘积累加，</font>**<font style="color:#000000;">保证数值正确性</font>**<font style="color:#000000;">的同时也让编译器可以</font>**<font style="color:#000000;">跳过 mask 外区域的计算</font>**<font style="color:#000000;">（dead code elimination）。</font>
+
+---
+
+## <font style="color:#000000;">优化点 11：</font>`<font style="color:#000000;">reset_to_zero</font>`<font style="color:#000000;"> 声明（累加器正确初始化）</font>
+**<font style="color:rgb(204, 204, 204);">v1 新增</font>**<font style="color:rgb(204, 204, 204);">：</font>
+
+```python
+reset_to_zero=['dq', 'dk', 'dv2', 'db', 'dg', 'dA'],
+```
+
+**收益原因**：
+
++ `dq`、`dk`、`dg` 等输出张量在 kernel 内部通过 `b_dq = tl.zeros(...)` 初始化，但多个 program 可能写入同一全局内存区域（尤其是多 shape 场景下），**autotune 重试不同 Config 时未清零会导致残留数据污染**。
++ `reset_to_zero` 确保 autotune 切换 Config 时自动将这些 buffer 清零，保证**不同 Config 之间的结果独立、正确**，避免 autotune 选出"看起来快但结果错误"的配置。
+
+# chunk_kda_bwd_kernel_intra优化（50ms->20ms）
+## 优化 1：NT 维度并行分裂（NSPLIT=3）
+**v0**：所有 NT 个 chunk 在同一个 program 内串行循环处理
+
+```python
+# v0: chunk_kda_bwd_intra
+for i_t_chunk in range(NT):    # 一个 program 处理全部 NT 个 chunk
+```
+
+**v1**：引入 `NSPLIT=3`，将 NT 个 chunk 均分到多个 program 实例并行执行
+
+```python
+# v1: chunk_kda_bwd_kernel_intra_glm
+NT_per_split = tl.cdiv(NT, NSPLIT)
+NT_start = i_split * NT_per_split
+NT_end = min((i_split + 1) * NT_per_split, NT)
+for i_t_chunk in range(NT_start, NT_end):   # 每个 program 只处理约 NT/3 个 chunk
+```
+
+Grid 维度变化：
+
++ v0: `(NK * NC, B * H)`
++ v1: `(NK * NC * 3, B * H)` — program 数量 3×
+
+新增 constexpr 参数：
+
++ `NSPLIT`: 分裂数（host 端设为 3）
++ `NK_NC_CONST`: 预计算的 `NK * NC`，用于编译期确定 program ID → `(i_split, i_k, i_i)` 的映射
+
+```python
+# v1 program ID 解码
+i_split = i_kc // NK_NC
+i_kc_inner = i_kc - i_split * NK_NC
+i_k, i_i = i_kc_inner // NC, i_kc_inner - (i_kc_inner // NC) * NC
+```
+
+**收益**：长序列场景下，v0 单 program 串行处理所有 chunk 是瓶颈；v1 将 workload 分散到 3 倍 program 上，在128k case下仅使用8个计算核心，因此这里切分成3块，将所有core都用上。
+
+---
+
+## 优化 2：BC 子块大小从 32 缩小到 16
+```python
+# v0
+BC = min(32, BT)
+# v1
+BC = min(16, BT)
+```
+
+**效果**：
+
++ NC 翻倍，可以多用一倍的核心
+
+---
+
+## 优化 3：Load 指令重排序（ILP / 延迟隐藏）
+### 下三角部分（i_i > 0 分支内的循环）
+**v0**：load k → load gk → compute b_kg → load dA（compute 阻塞后续 load）
+
+```python
+# v0
+b_k = tl.load(p_k)                # load 1
+b_gk = tl.load(p_gk)              # load 2
+b_kg = b_k * exp2(b_gn - b_gk)    # compute（依赖 load 1,2 结果）← 阻塞
+b_dAqk = tl.load(p_dAqk)          # load 3（被 compute 阻塞）
+b_dAkk = tl.load(p_dAkk)          # load 4
+```
+
+**v1**：先发射全部独立 load，再执行依赖 compute
+
+```python
+# v1
+b_k = tl.load(p_k)                # load 1
+b_dAqk = tl.load(p_dAqk)          # load 2（与 load 1 独立，可并行发射）
+b_dAkk = tl.load(p_dAkk)          # load 3（与 load 1,2 独立）
+b_gk = tl.load(p_gk)              # load 4
+b_kg = b_k * exp2(b_gn - b_gk)    # compute（在 4 个 load 均已发射后执行）
+```
+
+### 上三角部分（i_i < NC_local - 1 分支内的循环）
+**v0**：`b_b → b_q → b_kb(b_k*b_b) → b_gk → b_dAqk → b_dAkk`  
+**v1**：`b_q → b_dAqk → b_dAkk → b_b → b_kb(b_k*b_b) → b_gk`
+
+v1 将 `b_q`, `b_dAqk`, `b_dAkk` 三个独立 load 提前，避免 `b_kb` 计算阻塞后续 load 发射。
+
+**收益**：增加 memory pipeline 中 in-flight 请求数，减少 load-compute bubble，提升内存带宽利用率。
+
+---
